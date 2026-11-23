@@ -26,7 +26,7 @@ MAX_QUEUE = int(os.getenv("MAX_QUEUE", "15"))
 BPM_MIN = float(os.getenv("BPM_MIN", "75"))
 BPM_MAX = float(os.getenv("BPM_MAX", "175"))
 DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", "htdemucs")
-DEMUCS_SEGMENT = os.getenv("DEMUCS_SEGMENT", "7")
+DEMUCS_SEGMENT = os.getenv("DEMUCS_SEGMENT", "4")  # plus petit = moins de RAM
 
 ALL_STEMS = ("drums", "bass", "other", "vocals")
 
@@ -94,6 +94,15 @@ def detect_bpm(path: Path) -> int | None:
     return round(bpm)
 
 
+def clean_err(err: str) -> str:
+    """Enlève les barres de progression tqdm pour garder le vrai message d'erreur."""
+    lines = [
+        l.strip() for l in re.split(r"[\r\n]+", err)
+        if l.strip() and "seconds/s" not in l and "%|" not in l
+    ]
+    return "\n".join(lines)[-600:] or "aucun détail (voir les logs Railway)"
+
+
 def safe_stem(name: str) -> str:
     stem = Path(name).stem
     return re.sub(r"[^\w\-. ()]", "_", stem)[:80] or "audio"
@@ -152,7 +161,13 @@ async def process(job: Job):
     )
     stems_dir = out_root / DEMUCS_MODEL / "input"
     if code != 0 or not stems_dir.exists():
-        raise RuntimeError(f"Demucs a échoué : {err[-300:]}")
+        log.error("Demucs code=%s stderr:\n%s", code, err[-4000:])
+        if code in (-9, 137):
+            raise RuntimeError(
+                "Demucs a été tué par manque de mémoire (RAM). "
+                "Augmente la RAM du service Railway ou baisse DEMUCS_SEGMENT."
+            )
+        raise RuntimeError(f"Demucs a échoué (code {code}) : {clean_err(err)}")
 
     # 3. mixage des pistes conservées + encodage MP3 adapté à la limite Discord
     await edit_status(job, "🎛️ Mixage et encodage…")

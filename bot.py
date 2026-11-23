@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import discord
-import librosa
 import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -81,6 +80,10 @@ async def probe_duration(path: Path) -> float:
 
 
 def detect_bpm(path: Path) -> int | None:
+    # import tardif : librosa/numba pèsent plusieurs centaines de Mo de RAM,
+    # inutile de les charger pendant que Demucs tourne
+    import librosa
+
     y, sr = librosa.load(str(path), sr=22050, mono=True, duration=150)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     bpm = float(np.atleast_1d(tempo)[0])

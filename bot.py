@@ -25,7 +25,9 @@ MAX_QUEUE = int(os.getenv("MAX_QUEUE", "15"))
 BPM_MIN = float(os.getenv("BPM_MIN", "75"))
 BPM_MAX = float(os.getenv("BPM_MAX", "175"))
 DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", "htdemucs")
-DEMUCS_SEGMENT = os.getenv("DEMUCS_SEGMENT", "4")  # plus petit = moins de RAM
+DEMUCS_SEGMENT = os.getenv("DEMUCS_SEGMENT", "2")
+CHUNK_SECONDS = float(os.getenv("CHUNK_SECONDS", "30"))  # durée traitée par Demucs en une fois
+CHUNK_OVERLAP = float(os.getenv("CHUNK_OVERLAP", "1"))   # chevauchement pour le fondu enchaîné  # plus petit = moins de RAM
 
 ALL_STEMS = ("drums", "bass", "other", "vocals")
 
@@ -103,7 +105,7 @@ def clean_err(err: str) -> str:
         l.strip() for l in re.split(r"[\r\n]+", err)
         if l.strip() and "seconds/s" not in l and "%|" not in l
     ]
-    return "\n".join(lines)[-600:] or "aucun détail (voir les logs Railway)"
+    return "\n".join(lines)[-600:] or "no details (check the Railway logs)"
 
 
 def safe_stem(name: str) -> str:
@@ -121,10 +123,10 @@ def position_text(job: Job) -> str:
     try:
         idx = pending.index(job)
     except ValueError:
-        return "⏳ En file d'attente…"
+        return "⏳ In queue…"
     if idx == 0:
-        return "⚙️ Traitement en cours…"
-    return f"⏳ En file d'attente — position **{idx}**"
+        return "⚙️ Processing…"
+    return f"⏳ In queue — position **{idx}**"
 
 
 async def edit_status(job: Job, text: str):
@@ -144,7 +146,7 @@ async def refresh_positions():
 # ---------------------------------------------------------------- traitement
 async def process(job: Job):
     label, removed, _ = OPTIONS[job.remove]
-    await edit_status(job, "⚙️ Séparation des pistes en cours… (1 à 5 min)")
+    await edit_status(job, "⚙️ Separating tracks… (1–5 min)")
 
     # 1. conversion en wav 44.1 kHz stéréo
     wav = job.workdir / "input.wav"
@@ -152,55 +154,105 @@ async def process(job: Job):
         "ffmpeg", "-y", "-i", str(job.src), "-vn", "-ac", "2", "-ar", "44100", str(wav)
     )
     if code != 0:
-        raise RuntimeError(f"Conversion impossible : {err[-300:]}")
+        raise RuntimeError(f"Conversion failed: {clean_err(err)}")
 
-    # 2. Demucs (CPU)
-    out_root = job.workdir / "sep"
-    code, _, err = await run(
-        sys.executable, "-m", "demucs",
-        "-n", DEMUCS_MODEL, "-d", "cpu", "-j", "1",
-        "--segment", DEMUCS_SEGMENT, "--overlap", "0.1",
-        "-o", str(out_root), str(wav),
-    )
-    stems_dir = out_root / DEMUCS_MODEL / "input"
-    if code != 0 or not stems_dir.exists():
-        log.error("Demucs code=%s stderr:\n%s", code, err[-4000:])
-        if code in (-9, 137):
-            raise RuntimeError(
-                "Demucs a été tué par manque de mémoire (RAM). "
-                "Augmente la RAM du service Railway ou baisse DEMUCS_SEGMENT."
-            )
-        raise RuntimeError(f"Demucs a échoué (code {code}) : {clean_err(err)}")
-
-    # 3. mixage des pistes conservées + encodage MP3 adapté à la limite Discord
-    await edit_status(job, "🎛️ Mixage et encodage…")
-    keep = [stems_dir / f"{s}.wav" for s in ALL_STEMS if s not in removed]
-
+    # 2. découpe en morceaux (avec léger chevauchement) pour limiter la RAM de Demucs
     max_bytes = UPLOAD_LIMIT_MB * 1024 * 1024 * 0.96
     kbps = int(min(192, max_bytes * 8 / job.duration / 1000))
     if kbps < 64:
         raise RuntimeError(
-            "Morceau trop long pour la limite d'upload du serveur "
-            f"({UPLOAD_LIMIT_MB:g} Mo)."
+            "Track too long for this server's upload limit "
+            f"({UPLOAD_LIMIT_MB:g} MB)."
         )
 
-    out_name = f"{safe_stem(job.filename)}_sans_{job.remove}.mp3"
+    chunk_dir = job.workdir / "chunks"
+    chunk_dir.mkdir()
+    chunks: list[Path] = []
+    start = 0.0
+    while not chunks or start < job.duration - CHUNK_OVERLAP:
+        path = chunk_dir / f"c{len(chunks):03d}.wav"
+        code, _, err = await run(
+            "ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{CHUNK_SECONDS + CHUNK_OVERLAP:.3f}",
+            "-i", str(wav), "-c", "copy", str(path),
+        )
+        if code != 0 or not path.exists():
+            raise RuntimeError(f"Splitting failed: {clean_err(err)}")
+        chunks.append(path)
+        start += CHUNK_SECONDS
+    wav.unlink(missing_ok=True)
+
+    # 3. Demucs sur chaque morceau (un process par morceau : la RAM est libérée à chaque fois),
+    #    puis mixage immédiat des pistes conservées
+    out_root = job.workdir / "sep"
+    mixes: list[Path] = []
+    bpm_src = job.workdir / "bpm_drums.wav"
+    for i, chunk in enumerate(chunks):
+        await edit_status(job, f"⚙️ Separating tracks… ({i + 1}/{len(chunks)})")
+        code, _, err = await run(
+            sys.executable, "-m", "demucs",
+            "-n", DEMUCS_MODEL, "-d", "cpu", "-j", "1",
+            "--segment", DEMUCS_SEGMENT, "--overlap", "0.1",
+            "-o", str(out_root), str(chunk),
+        )
+        stems_dir = out_root / DEMUCS_MODEL / chunk.stem
+        if code != 0 or not stems_dir.exists():
+            log.error("Demucs code=%s stderr:\n%s", code, err[-4000:])
+            if code in (-9, 137):
+                raise RuntimeError(
+                    "Demucs ran out of memory (RAM). The memory limit of your Railway plan "
+                    "is too low for this model (Free = 0.5 GB, Trial = 1 GB)."
+                )
+            raise RuntimeError(f"Demucs failed (code {code}): {clean_err(err)}")
+
+        keep = [stems_dir / f"{s}.wav" for s in ALL_STEMS if s not in removed]
+        mix = chunk_dir / f"m{i:03d}.wav"
+        cmd = ["ffmpeg", "-y"]
+        for f in keep:
+            cmd += ["-i", str(f)]
+        cmd += [
+            "-filter_complex",
+            f"amix=inputs={len(keep)}:duration=longest:normalize=0",
+            "-c:a", "pcm_f32le", str(mix),
+        ]
+        code, _, err = await run(*cmd)
+        if code != 0 or not mix.exists():
+            raise RuntimeError(f"Mixing failed: {clean_err(err)}")
+        mixes.append(mix)
+
+        if i == len(chunks) // 2:  # piste drums d'un morceau du milieu, pour le BPM
+            shutil.copy(stems_dir / "drums.wav", bpm_src)
+        shutil.rmtree(stems_dir, ignore_errors=True)
+        chunk.unlink(missing_ok=True)
+
+    # 4. recollage avec fondu enchaîné + encodage MP3 adapté à la limite Discord
+    await edit_status(job, "🎛️ Mixing and encoding…")
+    out_name = f"{safe_stem(job.filename)}_no_{job.remove}.mp3"
     out_path = job.workdir / out_name
+
+    parts = []
+    prev = "[0:a]"
+    for i in range(1, len(mixes)):
+        node = f"[a{i}]"
+        parts.append(
+            f"{prev}[{i}:a]acrossfade=d={CHUNK_OVERLAP:g}:c1=tri:c2=tri{node}"
+        )
+        prev = node
+    parts.append(f"{prev}alimiter=limit=0.95:level=0[out]")
+
     cmd = ["ffmpeg", "-y"]
-    for f in keep:
-        cmd += ["-i", str(f)]
+    for m in mixes:
+        cmd += ["-i", str(m)]
     cmd += [
-        "-filter_complex",
-        f"amix=inputs={len(keep)}:duration=longest:normalize=0,alimiter=limit=0.95:level=0",
+        "-filter_complex", ";".join(parts), "-map", "[out]",
         "-c:a", "libmp3lame", "-b:a", f"{kbps}k", str(out_path),
     ]
     code, _, err = await run(*cmd)
     if code != 0 or not out_path.exists():
-        raise RuntimeError(f"Encodage échoué : {err[-300:]}")
+        raise RuntimeError(f"Encoding failed: {clean_err(err)}")
 
-    # 4. BPM (sur la piste drums, plus fiable ; repli sur le morceau complet)
+    # 5. BPM (sur la piste drums d'un morceau du milieu ; repli sur le début du morceau)
     bpm = None
-    for candidate in (stems_dir / "drums.wav", wav):
+    for candidate in (bpm_src, mixes[0]):
         try:
             bpm = await asyncio.to_thread(detect_bpm, candidate)
             if bpm:
@@ -208,14 +260,14 @@ async def process(job: Job):
         except Exception:
             log.exception("Détection BPM échouée sur %s", candidate)
 
-    # 5. envoi
+    # 6. envoi
     text = (
         f"<@{job.user_id}> ✅ **{job.filename}**\n"
-        f"🎚️ Retiré : **{label}**\n"
-        f"🥁 BPM : **{bpm if bpm else 'non détecté'}**"
+        f"🎚️ Removed: **{label}**\n"
+        f"🥁 BPM: **{bpm if bpm else 'not detected'}**"
     )
     await job.channel.send(text, file=discord.File(out_path, filename=out_name))
-    await edit_status(job, "✅ Terminé")
+    await edit_status(job, "✅ Done")
 
 
 async def worker():
@@ -225,10 +277,10 @@ async def worker():
             await process(job)
         except discord.HTTPException as e:
             log.exception("Envoi Discord échoué")
-            await edit_status(job, f"❌ Envoi impossible (fichier trop gros ?) : {e.status}")
+            await edit_status(job, f"❌ Couldn't upload the result (file too big?): {e.status}")
         except Exception as e:
             log.exception("Job %s échoué", job.id)
-            await edit_status(job, f"❌ Erreur : {e}")
+            await edit_status(job, f"❌ Error: {e}")
         finally:
             shutil.rmtree(job.workdir, ignore_errors=True)
             if job in pending:
@@ -252,7 +304,7 @@ class ChoiceView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.job.user_id:
             await interaction.response.send_message(
-                "Ce fichier n'est pas à toi.", ephemeral=True
+                "This file isn't yours.", ephemeral=True
             )
             return False
         return True
@@ -264,7 +316,7 @@ class ChoiceView(discord.ui.View):
                 return
             if len(pending) >= MAX_QUEUE:
                 await interaction.response.send_message(
-                    "La file d'attente est pleine, réessaie dans quelques minutes.",
+                    "The queue is full, try again in a few minutes.",
                     ephemeral=True,
                 )
                 return
@@ -285,7 +337,7 @@ class ChoiceView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(
-                    content="⌛ Temps écoulé, renvoie le fichier pour recommencer.", view=None
+                    content="⌛ Timed out, send the file again to start over.", view=None
                 )
             except discord.HTTPException:
                 pass
@@ -318,7 +370,7 @@ async def on_message(message: discord.Message):
     if att is None:
         return
     if att.size > MAX_INPUT_MB * 1024 * 1024:
-        await message.reply(f"❌ Fichier trop gros (max {MAX_INPUT_MB:g} Mo).", mention_author=False)
+        await message.reply(f"❌ File too large (max {MAX_INPUT_MB:g} MB).", mention_author=False)
         return
 
     workdir = Path(tempfile.mkdtemp(prefix="stem_"))
@@ -329,17 +381,17 @@ async def on_message(message: discord.Message):
     except Exception:
         log.exception("Téléchargement échoué")
         shutil.rmtree(workdir, ignore_errors=True)
-        await message.reply("❌ Impossible de lire ce fichier.", mention_author=False)
+        await message.reply("❌ Couldn't read that file.", mention_author=False)
         return
 
     if duration <= 0:
         shutil.rmtree(workdir, ignore_errors=True)
-        await message.reply("❌ Fichier audio illisible.", mention_author=False)
+        await message.reply("❌ Unreadable audio file.", mention_author=False)
         return
     if duration > MAX_DURATION:
         shutil.rmtree(workdir, ignore_errors=True)
         await message.reply(
-            f"❌ Morceau trop long (max {MAX_DURATION // 60} min).", mention_author=False
+            f"❌ Track too long (max {MAX_DURATION // 60} min).", mention_author=False
         )
         return
 
@@ -354,7 +406,7 @@ async def on_message(message: discord.Message):
     )
     view = ChoiceView(job)
     view.message = await message.reply(
-        f"🎚️ **{att.filename}** — Que veux-tu enlever ?", view=view, mention_author=False
+        f"🎚️ **{att.filename}** — What do you want to remove?", view=view, mention_author=False
     )
 
 

@@ -6,7 +6,8 @@ RUN apt-get update \
 
 ENV PYTHONUNBUFFERED=1 \
     TORCH_HOME=/models \
-    OMP_NUM_THREADS=4
+    OMP_NUM_THREADS=2 \
+    MALLOC_ARENA_MAX=2
 
 WORKDIR /app
 

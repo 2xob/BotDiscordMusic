@@ -1,0 +1,9 @@
+DISCORD_TOKEN=ton_token_ici
+# Optionnel : ID du salon autorisé (laisse vide ou 0 pour tous les salons)
+CHANNEL_ID=0
+# 10 par défaut. 25 ou 50 si ton serveur a des boosts.
+UPLOAD_LIMIT_MB=10
+MAX_DURATION_SECONDS=600
+MAX_QUEUE=15
+BPM_MIN=75
+BPM_MAX=175
